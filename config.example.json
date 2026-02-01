@@ -1,0 +1,14 @@
+{
+  "claude_api_key": "",
+  "audio": {
+    "input_source": "alsa_input.pci-0000_00_0e.0.analog-stereo",
+    "output_sink": "bluez_output.00_1F_47_E6_52_0C.1",
+    "default_latency_ms": 30
+  },
+  "presets": {
+    "movie": {"input": 120, "output": 85, "latency": 30},
+    "music": {"input": 100, "output": 80, "latency": 20},
+    "voice": {"input": 140, "output": 70, "latency": 25},
+    "night": {"input": 80, "output": 50, "latency": 30}
+  }
+}
