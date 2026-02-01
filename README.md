@@ -73,3 +73,4 @@ Or search "AI Audio Manager" in your application menu.
 ## License
 
 MIT
+# Auto-deploy trigger
