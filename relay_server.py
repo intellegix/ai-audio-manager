@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
-Render Relay Server - Accepts mobile requests and forwards to local machine via WebSocket
+Render Relay Server - Uses long-polling for reliable connection on free tier
 Deploy this to Render as a web service
 """
 
 from flask import Flask, request, jsonify, render_template_string
-from flask_sock import Sock
 import json
 import time
 import threading
 import uuid
+from collections import deque
 
 app = Flask(__name__)
-sock = Sock(app)
 
-# Store for connected local clients and pending requests
-local_clients = {}  # ws_id -> websocket
-pending_requests = {}  # request_id -> {event, response}
-client_lock = threading.Lock()
+# Stores for communication
+pending_requests = {}  # request_id -> {response, timestamp}
+request_queue = deque(maxlen=100)  # Requests waiting to be picked up by local client
+local_client_active = {'last_seen': 0}
+request_lock = threading.Lock()
 
 MOBILE_UI = '''
 <!DOCTYPE html>
@@ -125,8 +125,8 @@ MOBILE_UI = '''
         let debounceTimer;
         async function apiCall(endpoint, method='GET') {
             try {
-                const res = await fetch('/api' + endpoint, {method, timeout: 10000});
-                if (!res.ok) throw new Error('Not connected');
+                const res = await fetch('/api' + endpoint, {method});
+                if (!res.ok) throw new Error('offline');
                 return await res.json();
             } catch(e) {
                 document.getElementById('status').textContent = '⚠ Home server offline';
@@ -151,11 +151,11 @@ MOBILE_UI = '''
         function debounce(fn, delay) { clearTimeout(debounceTimer); debounceTimer = setTimeout(fn, delay); }
         document.getElementById('input-vol').addEventListener('input', function() {
             document.getElementById('input-val').textContent = this.value + '%';
-            debounce(() => apiCall('/input/' + this.value, 'POST'), 150);
+            debounce(() => apiCall('/input/' + this.value, 'POST'), 200);
         });
         document.getElementById('output-vol').addEventListener('input', function() {
             document.getElementById('output-val').textContent = this.value + '%';
-            debounce(() => apiCall('/output/' + this.value, 'POST'), 150);
+            debounce(() => apiCall('/output/' + this.value, 'POST'), 200);
         });
         document.getElementById('latency').addEventListener('input', function() {
             document.getElementById('latency-val').textContent = this.value + 'ms';
@@ -186,99 +186,108 @@ def index():
 
 @app.route('/health')
 def health():
-    with client_lock:
-        connected = len(local_clients) > 0
+    connected = (time.time() - local_client_active['last_seen']) < 15
     return jsonify({'status': 'ok', 'local_connected': connected})
 
-def forward_to_local(path, method='GET'):
-    """Forward request to local machine via WebSocket"""
-    with client_lock:
-        if not local_clients:
-            return jsonify({'error': 'Local server not connected'}), 503
-        # Get first available client
-        ws_id, ws = next(iter(local_clients.items()))
+# ===== Long-polling endpoints for local client =====
+
+@app.route('/tunnel/poll', methods=['GET'])
+def tunnel_poll():
+    """Local client polls for pending requests"""
+    local_client_active['last_seen'] = time.time()
+
+    # Wait up to 25s for a request (long-poll)
+    start = time.time()
+    while time.time() - start < 25:
+        with request_lock:
+            if request_queue:
+                req = request_queue.popleft()
+                return jsonify({'request': req})
+        time.sleep(0.1)
+
+    return jsonify({'request': None})
+
+@app.route('/tunnel/respond', methods=['POST'])
+def tunnel_respond():
+    """Local client sends response"""
+    local_client_active['last_seen'] = time.time()
+    data = request.json
+    request_id = data.get('id')
+    response = data.get('response')
+
+    with request_lock:
+        if request_id in pending_requests:
+            pending_requests[request_id]['response'] = response
+
+    return jsonify({'ok': True})
+
+# ===== API forwarding =====
+
+def forward_request(path, method):
+    """Queue request and wait for response from local client"""
+    if (time.time() - local_client_active['last_seen']) > 15:
+        return jsonify({'error': 'Local server not connected'}), 503
 
     request_id = str(uuid.uuid4())
-    event = threading.Event()
-    pending_requests[request_id] = {'event': event, 'response': None}
 
-    try:
-        # Send request to local machine
-        ws.send(json.dumps({
-            'id': request_id,
-            'path': path,
-            'method': method
-        }))
+    with request_lock:
+        pending_requests[request_id] = {'response': None, 'timestamp': time.time()}
+        request_queue.append({'id': request_id, 'path': path, 'method': method})
 
-        # Wait for response (timeout 10s)
-        if event.wait(timeout=10):
-            response = pending_requests[request_id]['response']
-            del pending_requests[request_id]
-            if response:
+    # Wait for response (up to 12s)
+    start = time.time()
+    while time.time() - start < 12:
+        with request_lock:
+            if pending_requests.get(request_id, {}).get('response') is not None:
+                response = pending_requests[request_id]['response']
+                del pending_requests[request_id]
                 return jsonify(response)
-            return jsonify({'error': 'Empty response'}), 500
-        else:
-            del pending_requests[request_id]
-            return jsonify({'error': 'Timeout'}), 504
-    except Exception as e:
+        time.sleep(0.1)
+
+    # Timeout - cleanup
+    with request_lock:
         if request_id in pending_requests:
             del pending_requests[request_id]
-        return jsonify({'error': str(e)}), 500
+
+    return jsonify({'error': 'Timeout'}), 504
 
 @app.route('/api/status')
 def api_status():
-    return forward_to_local('/api/status', 'GET')
+    return forward_request('/api/status', 'GET')
 
 @app.route('/api/input/<int:volume>', methods=['POST'])
 def api_input(volume):
-    return forward_to_local(f'/api/input/{volume}', 'POST')
+    return forward_request(f'/api/input/{volume}', 'POST')
 
 @app.route('/api/output/<int:volume>', methods=['POST'])
 def api_output(volume):
-    return forward_to_local(f'/api/output/{volume}', 'POST')
+    return forward_request(f'/api/output/{volume}', 'POST')
 
 @app.route('/api/latency/<int:ms>', methods=['POST'])
 def api_latency(ms):
-    return forward_to_local(f'/api/latency/{ms}', 'POST')
+    return forward_request(f'/api/latency/{ms}', 'POST')
 
 @app.route('/api/loopback/<state>', methods=['POST'])
 def api_loopback(state):
-    return forward_to_local(f'/api/loopback/{state}', 'POST')
+    return forward_request(f'/api/loopback/{state}', 'POST')
 
 @app.route('/api/preset/<name>', methods=['POST'])
 def api_preset(name):
-    return forward_to_local(f'/api/preset/{name}', 'POST')
+    return forward_request(f'/api/preset/{name}', 'POST')
 
-@sock.route('/tunnel')
-def tunnel(ws):
-    """WebSocket endpoint for local machine to connect"""
-    ws_id = str(uuid.uuid4())
-    print(f"Local client connected: {ws_id}")
+# Cleanup old pending requests periodically
+def cleanup_old_requests():
+    while True:
+        time.sleep(60)
+        now = time.time()
+        with request_lock:
+            old_ids = [k for k, v in pending_requests.items() if now - v['timestamp'] > 30]
+            for rid in old_ids:
+                del pending_requests[rid]
 
-    with client_lock:
-        local_clients[ws_id] = ws
-
-    try:
-        while True:
-            message = ws.receive()
-            if message is None:
-                break
-
-            data = json.loads(message)
-            request_id = data.get('id')
-
-            if request_id and request_id in pending_requests:
-                pending_requests[request_id]['response'] = data.get('response')
-                pending_requests[request_id]['event'].set()
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-    finally:
-        with client_lock:
-            if ws_id in local_clients:
-                del local_clients[ws_id]
-        print(f"Local client disconnected: {ws_id}")
+threading.Thread(target=cleanup_old_requests, daemon=True).start()
 
 if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, threaded=True)

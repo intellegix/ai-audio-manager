@@ -1,5 +1,2 @@
 flask>=3.0.0
-flask-sock>=0.7.0
 gunicorn>=21.0.0
-gevent>=24.0.0
-gevent-websocket>=0.10.1

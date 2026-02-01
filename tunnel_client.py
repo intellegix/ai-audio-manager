@@ -1,83 +1,139 @@
 #!/usr/bin/env python3
 """
-Tunnel Client - Connects to Render relay and forwards requests to local web server
+Tunnel Client - Long-polling based relay to Render
 Run this on the local machine alongside web_server.py
 """
 
-import json
+import requests
 import time
 import threading
-import websocket
-import requests
 import os
 import sys
 
 # Configuration
-RENDER_URL = os.environ.get('RENDER_URL', '')  # e.g., wss://ai-audio-manager.onrender.com/tunnel
+RENDER_URL = os.environ.get('RENDER_URL', 'https://ai-audio-manager.onrender.com')
 LOCAL_API = 'http://127.0.0.1:5000'
-RECONNECT_DELAY = 5
+POLL_TIMEOUT = 30
+RETRY_DELAY = 5
 
-def on_message(ws, message):
-    """Handle incoming request from relay server"""
+session = requests.Session()
+
+def handle_request(req):
+    """Forward request to local API and return response"""
     try:
-        data = json.loads(message)
-        request_id = data.get('id')
-        path = data.get('path', '/')
-        method = data.get('method', 'GET')
+        path = req['path']
+        method = req['method']
+        request_id = req['id']
 
-        # Forward to local API
         url = LOCAL_API + path
         if method == 'POST':
-            response = requests.post(url, timeout=5)
+            resp = session.post(url, timeout=5)
         else:
-            response = requests.get(url, timeout=5)
+            resp = session.get(url, timeout=5)
 
-        # Send response back
-        ws.send(json.dumps({
-            'id': request_id,
-            'response': response.json()
-        }))
+        # Send response back to Render
+        session.post(
+            f"{RENDER_URL}/tunnel/respond",
+            json={'id': request_id, 'response': resp.json()},
+            timeout=5
+        )
+        print(f"  Handled: {method} {path}")
     except Exception as e:
-        print(f"Error handling request: {e}")
-        if request_id:
-            ws.send(json.dumps({
-                'id': request_id,
-                'response': {'error': str(e)}
-            }))
+        print(f"  Error handling request: {e}")
+        try:
+            session.post(
+                f"{RENDER_URL}/tunnel/respond",
+                json={'id': req.get('id'), 'response': {'error': str(e)}},
+                timeout=5
+            )
+        except:
+            pass
 
-def on_error(ws, error):
-    print(f"WebSocket error: {error}")
-
-def on_close(ws, close_status_code, close_msg):
-    print(f"Connection closed. Reconnecting in {RECONNECT_DELAY}s...")
-
-def on_open(ws):
-    print("Connected to relay server!")
-
-def connect_loop():
-    """Maintain persistent connection to relay server"""
-    if not RENDER_URL:
-        print("Error: RENDER_URL environment variable not set")
-        print("Usage: RENDER_URL=wss://your-app.onrender.com/tunnel python3 tunnel_client.py")
-        sys.exit(1)
+def poll_loop():
+    """Main polling loop"""
+    consecutive_errors = 0
 
     while True:
         try:
-            print(f"Connecting to {RENDER_URL}...")
-            ws = websocket.WebSocketApp(
-                RENDER_URL,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
+            # Long-poll for requests
+            resp = session.get(
+                f"{RENDER_URL}/tunnel/poll",
+                timeout=POLL_TIMEOUT
             )
-            ws.run_forever(ping_interval=30, ping_timeout=10)
-        except Exception as e:
-            print(f"Connection failed: {e}")
 
-        time.sleep(RECONNECT_DELAY)
+            if resp.status_code == 200:
+                data = resp.json()
+                req = data.get('request')
+                if req:
+                    handle_request(req)
+                consecutive_errors = 0
+            else:
+                print(f"Poll error: {resp.status_code}")
+                consecutive_errors += 1
+
+        except requests.exceptions.Timeout:
+            # Normal timeout, just continue polling
+            consecutive_errors = 0
+            continue
+
+        except Exception as e:
+            print(f"Connection error: {e}")
+            consecutive_errors += 1
+
+        if consecutive_errors > 3:
+            print(f"Multiple errors, waiting {RETRY_DELAY}s...")
+            time.sleep(RETRY_DELAY)
+            consecutive_errors = 0
+
+def keep_alive():
+    """Ping Render periodically to prevent spin-down"""
+    while True:
+        time.sleep(300)  # Every 5 minutes
+        try:
+            resp = session.get(f"{RENDER_URL}/health", timeout=10)
+            if resp.status_code == 200:
+                print("Keep-alive ping OK")
+        except Exception as e:
+            print(f"Keep-alive failed: {e}")
+
+def main():
+    print("=" * 50)
+    print("  AI Audio Manager - Tunnel Client")
+    print("=" * 50)
+    print(f"  Relay: {RENDER_URL}")
+    print(f"  Local: {LOCAL_API}")
+    print("=" * 50)
+    print()
+
+    # Verify local server is running
+    try:
+        resp = session.get(f"{LOCAL_API}/api/status", timeout=3)
+        if resp.status_code == 200:
+            print("✓ Local server connected")
+        else:
+            print("✗ Local server returned error")
+    except:
+        print("✗ Local server not running!")
+        print("  Start it with: systemctl --user start ai-audio-manager")
+        return
+
+    # Verify Render is reachable
+    try:
+        resp = session.get(f"{RENDER_URL}/health", timeout=10)
+        print(f"✓ Render server reachable")
+    except Exception as e:
+        print(f"✗ Cannot reach Render: {e}")
+        print("  Will retry...")
+
+    print()
+    print("Listening for requests...")
+    print()
+
+    # Start keep-alive thread
+    threading.Thread(target=keep_alive, daemon=True).start()
+
+    # Start polling
+    poll_loop()
 
 if __name__ == '__main__':
-    print("AI Audio Manager - Tunnel Client")
-    print("=" * 40)
-    connect_loop()
+    main()
